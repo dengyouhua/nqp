@@ -66,34 +66,137 @@ class Makefile {
         )
     }
 
-    sub run($command) {
+    class Builder {
         my class Queue is repr('ConcBlockingQueue') { }
-        my $queue := nqp::create(Queue);
 
-        my $config := nqp::hash();
-        my $done := 0;
-        my $status;
-        $config<done> := -> $new-status {
-            ++$done;
-            $status := $new-status;
-        };
+        has $!makefile;
+        has $!queue;
 
-        my $task := nqp::spawnprocasync($queue, $command, nqp::cwd(), nqp::getenvhash(), $config);
-        nqp::permit($task, 1, -1);
-        nqp::permit($task, 2, -1);
-        while !$done {
-            if nqp::shift($queue) -> $task {
-                if nqp::list($task) {
-                    my $code := nqp::shift($task);
-                    $code(|$task);
-                }
-                else {
-                    $task();
-                }
+        my class Job {
+            has $!target;
+            has $!name;
+            has int $!status;
+            has @!prerequisites;
+            has $!modified;
+
+            method target() { $!target }
+            method name() { $!name }
+            method status() { $!status }
+            method set-status($new-status) { $!status := $new-status }
+            method prerequisites() { @!prerequisites }
+            method modified() { $!modified }
+            method set-modified($modified) { $!modified := $modified }
+        }
+
+        method build($target-name) {
+            $!queue := nqp::create(Queue);
+            my $job-tree := self.create-job($target-name);
+            until $job-tree.status == 2 {
+                my $job := self.find-next-job($job-tree);
+                self.build-job($job);
             }
         }
 
-        return $status;
+        method create-job($target-name, %jobs = nqp::hash()) {
+            my $target := $!makefile.target($target-name);
+            if $target {
+                my @prerequisites;
+                for $target.prerequisites -> $prerequisite {
+                    my $names := $!makefile.expand-macros($prerequisite);
+                    for split-names($names) {
+                        my $job;
+                        if nqp::existskey(%jobs, $_) {
+                            $job := %jobs{$_};
+                        }
+                        else {
+                            %jobs{$_} := $job := self.create-job($_, %jobs);
+                        }
+                        nqp::push(@prerequisites, $job) if $job;
+                    }
+                }
+                return Job.new(:$target, :name($target-name), :@prerequisites);
+            }
+            elsif $target-name {
+                nqp::die("Unknown target $target-name") unless file-exists($target-name);
+            }
+            return Nil;
+        }
+
+        method find-next-job($job-tree) {
+            if $job-tree.status == 0 {
+                my $buildable := 1;
+                for $job-tree.prerequisites -> $prerequisite {
+                    $buildable := 0 if $prerequisite.status < 2;
+                    my $job := self.find-next-job($prerequisite);
+                    return $job if $job;
+                }
+                return $job-tree;
+            }
+            return Nil;
+        }
+
+        method run($command) {
+            my $config := nqp::hash();
+            my $done := 0;
+            my $status;
+            $config<done> := -> $new-status {
+                ++$done;
+                $status := $new-status;
+            };
+
+            my $task := nqp::spawnprocasync($!queue, $command, nqp::cwd(), nqp::getenvhash(), $config);
+            nqp::permit($task, 1, -1);
+            nqp::permit($task, 2, -1);
+            while !$done {
+                if nqp::shift($!queue) -> $task {
+                    if nqp::list($task) {
+                        my $code := nqp::shift($task);
+                        $code(|$task);
+                    }
+                    else {
+                        $task();
+                    }
+                }
+            }
+
+            return $status;
+        }
+
+        method build-job($job) {
+            $job.set-status(1);
+            my $newest := 0;
+            for $job.prerequisites -> $prerequisite {
+                my $modified := $prerequisite.modified;
+                $newest := $modified if $modified > $newest;
+            }
+            my $modified := $job.modified;
+            if $modified == 0 || $newest > $modified {
+                for $job.target.recipe -> $command {
+                    $command := $!makefile.expand-macros($command);
+                    my $check-exit-status := 1;
+                    if nqp::substr($command, 0, 1) eq '-' {
+                        $command := nqp::substr($command, 1);
+                        $check-exit-status := 0;
+                    }
+                    if nqp::substr($command, 0, 5) eq '@echo' {
+                        say(nqp::substr($command, 6));
+                        next;
+                    }
+                    note($command);
+                    my $is-windows := nqp::backendconfig()<osname> eq 'MSWin32';
+                    my $args := $is-windows ?? nqp::list(nqp::getenvhash()<ComSpec>, '/c', $command)
+                        !! nqp::list('/bin/sh', '-c', $command);
+                    my $status := self.run($args);
+                    nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
+                }
+
+                if file-exists($job.name) {
+                    $modified := file-modified($job.name);
+                    $job.set-modified($modified);
+                }
+            }
+            $job.set-status(2);
+        }
     }
 
     method make($target-name, %built = nqp::hash()) {
@@ -128,7 +231,7 @@ class Makefile {
                     my $is-windows := nqp::backendconfig()<osname> eq 'MSWin32';
                     my $args := $is-windows ?? nqp::list(nqp::getenvhash()<ComSpec>, '/c', $command)
                         !! nqp::list('/bin/sh', '-c', $command);
-                    my $status := run($args);
+                    my $status := self.run($args);
                     nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
                 }
 
@@ -309,6 +412,7 @@ sub MAIN(*@ARGS) {
         say($make.ast.expand-macros($_.name)) for $make.ast.targets;
     }
     else {
-        $make.ast.make(@ARGS[1]);
+        #$make.ast.make(@ARGS[1]);
+        Makefile::Builder.new(:makefile($make.ast)).build(@ARGS[1]);
     }
 }
