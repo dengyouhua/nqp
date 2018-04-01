@@ -135,31 +135,36 @@ class Makefile {
             return Nil;
         }
 
-        method run($command) {
-            my $config := nqp::hash();
-            my $done := 0;
-            my $status;
-            $config<done> := -> $new-status {
-                ++$done;
-                $status := $new-status;
-            };
-
+        method run($command, $config) {
             my $task := nqp::spawnprocasync($!queue, $command, nqp::cwd(), nqp::getenvhash(), $config);
             nqp::permit($task, 1, -1);
             nqp::permit($task, 2, -1);
-            while !$done {
-                if nqp::shift($!queue) -> $task {
-                    if nqp::list($task) {
-                        my $code := nqp::shift($task);
-                        $code(|$task);
-                    }
-                    else {
-                        $task();
-                    }
+        }
+
+        method run-next-command(@recipe) {
+            my $command := @recipe[0];
+            my $check-exit-status := 1;
+            if nqp::substr($command, 0, 1) eq '-' {
+                $command := nqp::substr($command, 1);
+                $check-exit-status := 0;
+            }
+            if nqp::substr($command, 0, 5) eq '@echo' {
+                say(nqp::substr($command, 6));
+                next;
+            }
+            note($command);
+            my $is-windows := nqp::backendconfig()<osname> eq 'MSWin32';
+            my $args := $is-windows ?? nqp::list(nqp::getenvhash()<ComSpec>, '/c', $command)
+                !! nqp::list('/bin/sh', '-c', $command);
+            my $config := nqp::hash();
+            $config<done> := -> $status {
+                nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
+                nqp::shift(@recipe);
+                if @recipe {
+                    self.run-next-command(@recipe);
                 }
             }
-
-            return $status;
+            self.run($args, $config);
         }
 
         method build-job($job) {
@@ -171,23 +176,24 @@ class Makefile {
             }
             my $modified := $job.modified;
             if $modified == 0 || $newest > $modified {
+                my @recipe;
                 for $job.target.recipe -> $command {
                     $command := $!makefile.expand-macros($command);
-                    my $check-exit-status := 1;
-                    if nqp::substr($command, 0, 1) eq '-' {
-                        $command := nqp::substr($command, 1);
-                        $check-exit-status := 0;
+                    nqp::push(@recipe, $command);
+                }
+
+                self.run-next-command(@recipe) if @recipe;
+
+                while @recipe {
+                    if nqp::shift($!queue) -> $task {
+                        if nqp::list($task) {
+                            my $code := nqp::shift($task);
+                            $code(|$task);
+                        }
+                        else {
+                            $task();
+                        }
                     }
-                    if nqp::substr($command, 0, 5) eq '@echo' {
-                        say(nqp::substr($command, 6));
-                        next;
-                    }
-                    note($command);
-                    my $is-windows := nqp::backendconfig()<osname> eq 'MSWin32';
-                    my $args := $is-windows ?? nqp::list(nqp::getenvhash()<ComSpec>, '/c', $command)
-                        !! nqp::list('/bin/sh', '-c', $command);
-                    my $status := self.run($args);
-                    nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
                 }
 
                 if file-exists($job.name) {
