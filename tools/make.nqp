@@ -95,7 +95,7 @@ class Makefile {
             my $j := 3;
             while $j-- {
                 my $next-job := self.find-next-job($!job-tree);
-                self.build-job($next-job);
+                self.build-job($next-job) if $next-job;
             }
             until $!job-tree.status == 2 {
                 if nqp::shift($!queue) -> $task {
