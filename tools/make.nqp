@@ -210,63 +210,18 @@ class Makefile {
                     nqp::push(@recipe, $command);
                 }
 
-                self.run-next-command($job, @recipe) if @recipe;
+                if @recipe {
+                    self.run-next-command($job, @recipe);
+                }
+                else { # nothing to do actually, so mark it as done immediately
+                    $job.set-status(2);
+                }
             }
         }
     }
 
-    method make($target-name, %built = nqp::hash()) {
-        if nqp::existskey(%built, $target-name) { return }
-        my $target := self.target($target-name);
-        my $newest := 0;
-        if $target {
-            my $modified := 0;
-            $modified := file-modified($target-name) if file-exists($target-name);
-
-            for $target.prerequisites -> $prerequisite {
-                my $names := self.expand-macros($prerequisite);
-                for split-names($names) {
-                    my $modified := self.make($_, %built);
-                    $newest := $modified if $modified > $newest;
-                }
-            }
-
-            if $modified == 0 || $newest > $modified {
-                for $target.recipe -> $command {
-                    $command := self.expand-macros($command);
-                    my $check-exit-status := 1;
-                    if nqp::substr($command, 0, 1) eq '-' {
-                        $command := nqp::substr($command, 1);
-                        $check-exit-status := 0;
-                    }
-                    if nqp::substr($command, 0, 5) eq '@echo' {
-                        say(nqp::substr($command, 6));
-                        next;
-                    }
-                    note($command);
-                    my $is-windows := nqp::backendconfig()<osname> eq 'MSWin32';
-                    my $args := $is-windows ?? nqp::list(nqp::getenvhash()<ComSpec>, '/c', $command)
-                        !! nqp::list('/bin/sh', '-c', $command);
-                    my $status := self.run($args);
-                    nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
-                }
-
-                if file-exists($target-name) {
-                    $modified := file-modified($target-name);
-                    $newest := $modified if $modified > $newest;
-                }
-            }
-
-            %built{$target-name} := 1;
-        }
-        elsif $target-name {
-            unless file-exists($target-name) {
-                nqp::die("don't know how to create file $target-name");
-            }
-            my $modified := file-modified($target-name);
-            $newest := $modified if $modified > $newest;
-        }
-        return $newest;
+    method make($target-name) {
+        Makefile::Builder.new(:makefile(self)).build($target-name);
     }
 }
 
@@ -428,7 +383,6 @@ sub MAIN(*@ARGS) {
         say($make.ast.expand-macros($_.name)) for $make.ast.targets;
     }
     else {
-        #$make.ast.make(@ARGS[1]);
-        Makefile::Builder.new(:makefile($make.ast)).build(@ARGS[1]);
+        $make.ast.make(@ARGS[1]);
     }
 }
