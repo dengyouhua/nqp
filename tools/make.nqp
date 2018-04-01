@@ -71,6 +71,7 @@ class Makefile {
 
         has $!makefile;
         has $!queue;
+        has $!job-tree;
 
         my class Job {
             has $!target;
@@ -90,10 +91,19 @@ class Makefile {
 
         method build($target-name) {
             $!queue := nqp::create(Queue);
-            my $job-tree := self.create-job($target-name);
-            until $job-tree.status == 2 {
-                my $job := self.find-next-job($job-tree);
-                self.build-job($job);
+            $!job-tree := self.create-job($target-name);
+            my $next-job := self.find-next-job($!job-tree);
+            self.build-job($next-job);
+            until $!job-tree.status == 2 {
+                if nqp::shift($!queue) -> $task {
+                    if nqp::list($task) {
+                        my $code := nqp::shift($task);
+                        $code(|$task);
+                    }
+                    else {
+                        $task();
+                    }
+                }
             }
         }
 
@@ -141,7 +151,7 @@ class Makefile {
             nqp::permit($task, 2, -1);
         }
 
-        method run-next-command(@recipe) {
+        method run-next-command($job, @recipe) {
             my $command := @recipe[0];
             my $check-exit-status := 1;
             if nqp::substr($command, 0, 1) eq '-' {
@@ -161,7 +171,17 @@ class Makefile {
                 nqp::die("Got $status from $args") if $check-exit-status && $status != 0;
                 nqp::shift(@recipe);
                 if @recipe {
-                    self.run-next-command(@recipe);
+                    self.run-next-command($job, @recipe);
+                }
+                else {
+                    if file-exists($job.name) {
+                        my $modified := file-modified($job.name);
+                        $job.set-modified($modified);
+                    }
+                    $job.set-status(2);
+
+                    my $next-job := self.find-next-job($!job-tree);
+                    self.build-job($next-job) if $next-job;
                 }
             }
             self.run($args, $config);
@@ -182,26 +202,8 @@ class Makefile {
                     nqp::push(@recipe, $command);
                 }
 
-                self.run-next-command(@recipe) if @recipe;
-
-                while @recipe {
-                    if nqp::shift($!queue) -> $task {
-                        if nqp::list($task) {
-                            my $code := nqp::shift($task);
-                            $code(|$task);
-                        }
-                        else {
-                            $task();
-                        }
-                    }
-                }
-
-                if file-exists($job.name) {
-                    $modified := file-modified($job.name);
-                    $job.set-modified($modified);
-                }
+                self.run-next-command($job, @recipe) if @recipe;
             }
-            $job.set-status(2);
         }
     }
 
